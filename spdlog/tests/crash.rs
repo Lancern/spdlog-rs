@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Command, sync::Arc};
+use std::{
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
 use spdlog::{
     formatter::{pattern, PatternFormatter},
@@ -9,6 +13,7 @@ use spdlog::{
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 enum CrashType {
+    NoCrash,
     Panic,
     NullPtrDeref,
     CAbort,
@@ -17,21 +22,32 @@ enum CrashType {
 #[test]
 fn test_flush_on_crash() {
     if let Ok(crash_type_env) = std::env::var("CRASH_TYPE") {
-        let crash_type: CrashType = unsafe { std::mem::transmute(crash_type_env.parse::<u8>().unwrap()) };
+        let crash_type: CrashType =
+            unsafe { std::mem::transmute(crash_type_env.parse::<u8>().unwrap()) };
 
         setup_global_logger();
 
         spdlog::info!("hello");
 
         match crash_type {
+            CrashType::NoCrash => {
+                return;
+            }
             CrashType::Panic => panic!("panic delibrately"),
             CrashType::NullPtrDeref => {
                 let null_ptr: *const i32 = std::ptr::null();
-                unsafe { std::ptr::read_volatile(null_ptr); }
+                unsafe {
+                    std::ptr::read_volatile(null_ptr);
+                }
+                unreachable!();
             }
             CrashType::CAbort => {
-                extern "C" { fn abort(); }
-                unsafe { abort(); }
+                extern "C" {
+                    fn abort();
+                }
+                unsafe {
+                    abort();
+                }
             }
         }
     }
@@ -43,6 +59,8 @@ fn test_flush_on_crash() {
         // Launch the victim child process and inspect the log file after it finishes.
         Command::new(std::env::current_exe().unwrap())
             .args(std::env::args().skip(1))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .env("CRASH_TYPE", (crash_type as u8).to_string())
             .spawn()
             .unwrap()
@@ -50,9 +68,15 @@ fn test_flush_on_crash() {
             .unwrap();
 
         let log_file_content = std::fs::read_to_string(&log_file_path).unwrap();
-        assert_eq!(log_file_content.trim(), "hello", "crash type {:?} failed", crash_type);
+        assert_eq!(
+            log_file_content.trim(),
+            "hello",
+            "crash type {:?} failed",
+            crash_type
+        );
     }
 
+    test_crash_type(CrashType::NoCrash);
     test_crash_type(CrashType::Panic);
     test_crash_type(CrashType::NullPtrDeref);
     test_crash_type(CrashType::CAbort);

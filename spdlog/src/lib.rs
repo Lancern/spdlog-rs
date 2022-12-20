@@ -250,6 +250,7 @@ pub mod prelude {
 use std::{
     env::{self, VarError},
     ffi::OsStr,
+    mem::MaybeUninit,
     panic,
     result::Result as StdResult,
 };
@@ -657,15 +658,16 @@ fn flush_default_logger_at_exit() {
         }
     }
 
-    #[must_use]
-    fn try_atexit() -> bool {
+    fn hook_normal_exit() {
         use std::os::raw::c_int;
 
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> c_int;
         }
 
-        (unsafe { atexit(handler) }) == 0
+        unsafe {
+            atexit(handler);
+        }
     }
 
     fn hook_panic() {
@@ -677,9 +679,145 @@ fn flush_default_logger_at_exit() {
         }));
     }
 
-    if !try_atexit() {
-        hook_panic() // at least
+    #[cfg(any(target_os = "unix", target_os = "linux"))]
+    fn hook_unix_signals() {
+        use std::os::raw::{c_int, c_void};
+
+        struct OldActions {
+            sigabrt: MaybeUninit<libc::sigaction>,
+            sigalrm: MaybeUninit<libc::sigaction>,
+            sigbus: MaybeUninit<libc::sigaction>,
+            sigfpe: MaybeUninit<libc::sigaction>,
+            sighup: MaybeUninit<libc::sigaction>,
+            sigill: MaybeUninit<libc::sigaction>,
+            sigint: MaybeUninit<libc::sigaction>,
+            sigio: MaybeUninit<libc::sigaction>,
+            sigpipe: MaybeUninit<libc::sigaction>,
+            sigprof: MaybeUninit<libc::sigaction>,
+            sigpwr: MaybeUninit<libc::sigaction>,
+            sigquit: MaybeUninit<libc::sigaction>,
+            sigsegv: MaybeUninit<libc::sigaction>,
+            sigstkflt: MaybeUninit<libc::sigaction>,
+            sigsys: MaybeUninit<libc::sigaction>,
+            sigterm: MaybeUninit<libc::sigaction>,
+            sigtrap: MaybeUninit<libc::sigaction>,
+            sigusr1: MaybeUninit<libc::sigaction>,
+            sigusr2: MaybeUninit<libc::sigaction>,
+            sigxcpu: MaybeUninit<libc::sigaction>,
+            sigxfsz: MaybeUninit<libc::sigaction>,
+        }
+
+        impl OldActions {
+            const fn new() -> Self {
+                Self {
+                    sigabrt: MaybeUninit::uninit(),
+                    sigalrm: MaybeUninit::uninit(),
+                    sigbus: MaybeUninit::uninit(),
+                    sigfpe: MaybeUninit::uninit(),
+                    sighup: MaybeUninit::uninit(),
+                    sigill: MaybeUninit::uninit(),
+                    sigint: MaybeUninit::uninit(),
+                    sigio: MaybeUninit::uninit(),
+                    sigpipe: MaybeUninit::uninit(),
+                    sigprof: MaybeUninit::uninit(),
+                    sigpwr: MaybeUninit::uninit(),
+                    sigquit: MaybeUninit::uninit(),
+                    sigsegv: MaybeUninit::uninit(),
+                    sigstkflt: MaybeUninit::uninit(),
+                    sigsys: MaybeUninit::uninit(),
+                    sigterm: MaybeUninit::uninit(),
+                    sigtrap: MaybeUninit::uninit(),
+                    sigusr1: MaybeUninit::uninit(),
+                    sigusr2: MaybeUninit::uninit(),
+                    sigxcpu: MaybeUninit::uninit(),
+                    sigxfsz: MaybeUninit::uninit(),
+                }
+            }
+        }
+
+        static mut OLD_ACTIONS: OldActions = OldActions::new();
+
+        type SignalActionFn = extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void);
+
+        extern "C" fn signal_handler(
+            sig: c_int,
+            info: *mut libc::siginfo_t,
+            ucontext: *mut c_void,
+        ) {
+            handler();
+
+            let old_action = match sig {
+                libc::SIGABRT => unsafe { OLD_ACTIONS.sigabrt.assume_init_ref() },
+                libc::SIGALRM => unsafe { OLD_ACTIONS.sigalrm.assume_init_ref() },
+                libc::SIGBUS => unsafe { OLD_ACTIONS.sigbus.assume_init_ref() },
+                libc::SIGFPE => unsafe { OLD_ACTIONS.sigfpe.assume_init_ref() },
+                libc::SIGHUP => unsafe { OLD_ACTIONS.sighup.assume_init_ref() },
+                libc::SIGILL => unsafe { OLD_ACTIONS.sigill.assume_init_ref() },
+                libc::SIGINT => unsafe { OLD_ACTIONS.sigint.assume_init_ref() },
+                libc::SIGIO => unsafe { OLD_ACTIONS.sigio.assume_init_ref() },
+                libc::SIGPIPE => unsafe { OLD_ACTIONS.sigpipe.assume_init_ref() },
+                libc::SIGPROF => unsafe { OLD_ACTIONS.sigprof.assume_init_ref() },
+                libc::SIGPWR => unsafe { OLD_ACTIONS.sigpwr.assume_init_ref() },
+                libc::SIGQUIT => unsafe { OLD_ACTIONS.sigquit.assume_init_ref() },
+                libc::SIGSEGV => unsafe { OLD_ACTIONS.sigsegv.assume_init_ref() },
+                libc::SIGSTKFLT => unsafe { OLD_ACTIONS.sigstkflt.assume_init_ref() },
+                libc::SIGSYS => unsafe { OLD_ACTIONS.sigsys.assume_init_ref() },
+                libc::SIGTERM => unsafe { OLD_ACTIONS.sigterm.assume_init_ref() },
+                libc::SIGTRAP => unsafe { OLD_ACTIONS.sigtrap.assume_init_ref() },
+                libc::SIGUSR1 => unsafe { OLD_ACTIONS.sigusr1.assume_init_ref() },
+                libc::SIGUSR2 => unsafe { OLD_ACTIONS.sigusr2.assume_init_ref() },
+                libc::SIGXCPU => unsafe { OLD_ACTIONS.sigxcpu.assume_init_ref() },
+                libc::SIGXFSZ => unsafe { OLD_ACTIONS.sigxfsz.assume_init_ref() },
+                _ => {
+                    return;
+                }
+            };
+            if old_action.sa_sigaction != libc::SIG_IGN && old_action.sa_sigaction != libc::SIG_DFL
+            {
+                let old_action_fn: SignalActionFn =
+                    unsafe { std::mem::transmute(old_action.sa_sigaction) };
+                old_action_fn(sig, info, ucontext);
+            }
+        }
+
+        fn register_signal_handler(sig: i32, old_action: &mut MaybeUninit<libc::sigaction>) {
+            let mut action = unsafe { MaybeUninit::<libc::sigaction>::zeroed().assume_init() };
+            action.sa_sigaction = signal_handler as SignalActionFn as usize;
+            unsafe {
+                libc::sigaction(sig, &action, old_action.as_mut_ptr());
+            }
+        }
+
+        register_signal_handler(libc::SIGABRT, unsafe { &mut OLD_ACTIONS.sigabrt });
+        register_signal_handler(libc::SIGALRM, unsafe { &mut OLD_ACTIONS.sigalrm });
+        register_signal_handler(libc::SIGBUS, unsafe { &mut OLD_ACTIONS.sigbus });
+        register_signal_handler(libc::SIGFPE, unsafe { &mut OLD_ACTIONS.sigfpe });
+        register_signal_handler(libc::SIGHUP, unsafe { &mut OLD_ACTIONS.sighup });
+        register_signal_handler(libc::SIGILL, unsafe { &mut OLD_ACTIONS.sigill });
+        register_signal_handler(libc::SIGINT, unsafe { &mut OLD_ACTIONS.sigint });
+        register_signal_handler(libc::SIGIO, unsafe { &mut OLD_ACTIONS.sigio });
+        register_signal_handler(libc::SIGPIPE, unsafe { &mut OLD_ACTIONS.sigpipe });
+        register_signal_handler(libc::SIGPROF, unsafe { &mut OLD_ACTIONS.sigprof });
+        register_signal_handler(libc::SIGPWR, unsafe { &mut OLD_ACTIONS.sigpwr });
+        register_signal_handler(libc::SIGQUIT, unsafe { &mut OLD_ACTIONS.sigquit });
+        register_signal_handler(libc::SIGSEGV, unsafe { &mut OLD_ACTIONS.sigsegv });
+        register_signal_handler(libc::SIGSTKFLT, unsafe { &mut OLD_ACTIONS.sigstkflt });
+        register_signal_handler(libc::SIGSYS, unsafe { &mut OLD_ACTIONS.sigsys });
+        register_signal_handler(libc::SIGTERM, unsafe { &mut OLD_ACTIONS.sigterm });
+        register_signal_handler(libc::SIGTRAP, unsafe { &mut OLD_ACTIONS.sigtrap });
+        register_signal_handler(libc::SIGUSR1, unsafe { &mut OLD_ACTIONS.sigusr1 });
+        register_signal_handler(libc::SIGUSR2, unsafe { &mut OLD_ACTIONS.sigusr2 });
+        register_signal_handler(libc::SIGXCPU, unsafe { &mut OLD_ACTIONS.sigxcpu });
+        register_signal_handler(libc::SIGXFSZ, unsafe { &mut OLD_ACTIONS.sigxfsz });
     }
+
+    hook_normal_exit();
+    hook_panic();
+
+    #[cfg(any(target_os = "unix", target_os = "linux"))]
+    hook_unix_signals();
+
+    // TODO: add Windows specific crash hooks.
 }
 
 fn default_error_handler(from: impl AsRef<str>, error: Error) {
